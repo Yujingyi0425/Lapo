@@ -1,6 +1,58 @@
 #!/usr/bin/env python3
 """
 Based on https://github.com/sfujim/BCQ
+参数解析 → 环境设置 → 数据加载 → 政策初始化 → 训练循环 → 评估 → 保存
+python main_d4rl.py --env_name maze2d-umaze-v1 --device cuda --ExpID 0001
+"""
+"""
+参数	        默认值	                          说明
+--env_name	    maze2d-large-v1	                D4RL环境名称
+--max_timesteps	1e6	                            最大训练步数
+--eval_freq	    5e3	                            每5000步评估一次
+--save_freq	    5e5	                            每50万步保存一次模型
+--batch_size	512	                            小批量大小
+--vae_lr	    2e-4	                        VAE学习率
+--actor_lr	    2e-4	                        Actor学习率
+--critic_lr	    2e-4	                        Critic学习率
+--expectile	    0.9	                            加权VAE的期望分位数
+--kl_beta	    1.0	                            KL散度权重
+--discount	    0.99	                        折扣因子 γ
+--tau	        0.005	                        软更新系数
+"""
+"""
+┌─────────────────────────────────────────┐
+│  加载D4RL离线数据集到ReplayBuffer      │
+│  初始化 VAE + Actor + Critic            │
+└──────────────┬──────────────────────────┘
+               │
+        ┌──────▼─────────┐
+        │  训练循环      │
+        │ (每5000步)     │
+        └──────┬─────────┘
+               │
+    ┌──────────┼──────────┐
+    │          │          │
+┌───▼────┐ ┌──▼────┐ ┌───▼────┐
+│训练VAE │ │训练  │ │训练   │
+│(重建) │ │Actor │ │Critic │
+└────────┘ └──────┘ └───────┘
+    │          │          │
+    └──────────┼──────────┘
+               │
+        ┌──────▼──────────┐
+        │ 软更新目标网络  │
+        │ (τ=0.005)      │
+        └─────────────────┘
+               │
+        ┌──────▼──────────┐
+        │  10个Episode评估 │
+        │ 记录分数到CSV   │
+        └─────────────────┘
+               │
+        ┌──────▼──────────┐
+        │ 每50万步保存    │
+        │   模型检查点    │
+        └─────────────────┘
 """
 import argparse, os, torch
 import numpy as np
@@ -22,6 +74,7 @@ def eval_policy(policy, env, eval_episodes=10, plot=False):
         states_list = []
         start_states.append(state)
         while not done:
+            # 用训练好的政策选择动作（无噪声）
             action = policy.select_action(np.array(state))
             state, reward, done, _ = env.step(action)
             avg_reward += reward
@@ -29,6 +82,9 @@ def eval_policy(policy, env, eval_episodes=10, plot=False):
         states_list = np.array(states_list)
 
         if plot:
+            # 红点：初始状态 Maze2d
+            # 彩色点：轨迹
+            # 白点：目标位置
             plt.scatter(states_list[:,0], states_list[:,1], color = color_list[i], alpha=0.1)
             plt.scatter(8, 10, color = 'white', alpha=0.1)
             plt.scatter(2, 0, color = 'white', alpha=0.1)
@@ -36,7 +92,7 @@ def eval_policy(policy, env, eval_episodes=10, plot=False):
         start_states = np.array(start_states)
         plt.scatter(start_states[:,0], start_states[:,1], color='red')
         plt.savefig('./eval_fig') 
-
+    # 计算平均奖励和归一化分数
     avg_reward /= eval_episodes
     normalized_score = env.get_normalized_score(avg_reward)
 
@@ -106,18 +162,26 @@ if __name__ == "__main__":
     # Load Dataset
     dataset = d4rl.qlearning_dataset(env)  # Load d4rl dataset
     if 'antmaze' in args.env_name:
+        # Antmaze环境：二元奖励 (0/1)
         dataset['rewards'] = (dataset['rewards']*100)
         min_v = 0
         max_v = 1 * 100
     else:
+        # 其他环境：归一化到[0,1]
         dataset['rewards'] = dataset['rewards']/dataset['rewards'].max()
         min_v = dataset['rewards'].min()/(1-args.discount)
         max_v = dataset['rewards'].max()/(1-args.discount)
 
+    """
+    将D4RL数据集加载到缓冲区，包括：
+    状态归一化
+    动作归一化
+    计算统计量（均值、标准差）
+    """
     replay_buffer = utils.ReplayBuffer(state_dim, action_dim, args.device, max_size=len(dataset['rewards']))
     replay_buffer.load(dataset)
 
-    latent_dim = action_dim*2
+    latent_dim = action_dim*2     # 隐空间维度 = 动作维度的2倍
     policy = algos.Latent(state_dim, action_dim, latent_dim, max_action, min_v, max_v, replay_buffer=replay_buffer, 
                         device=args.device, discount=args.discount, tau=args.tau, 
                         vae_lr=args.vae_lr, actor_lr=args.actor_lr, critic_lr=args.critic_lr, 
@@ -130,20 +194,27 @@ if __name__ == "__main__":
     else:
         training_iters = 0
 
+    """
+    每5000步训练一次（每次512个batch）
+    每50万步保存一次模型检查点
+    每5000步进行一次评估
+    将结果记录到CSV进度文件
+    """
     while training_iters < args.max_timesteps:
-        # Train
+        # Step 1: 训练
         pol_vals = policy.train(iterations=int(args.eval_freq)
                                 , batch_size=args.batch_size)
         training_iters += args.eval_freq
         print("Training iterations: " + str(training_iters))
         logger.record_tabular('Training Epochs', int(training_iters // int(args.eval_freq)))
 
-        # Save Model
+        # Step 2: 定期保存模型
         if training_iters % args.save_freq == 0 and args.save_model:
             policy.save('model_' + str(training_iters), folder_name)
 
-        # Eval
+        # Step 3: 评估政策
         info = eval_policy(policy, env, plot=args.plot)
+        # Step 4: 记录日志
         for k, v in info.items():
             logger.record_tabular(k, v)
 

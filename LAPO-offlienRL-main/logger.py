@@ -2,6 +2,7 @@
 Based on rllab's logger.
 
 https://github.com/rll/rllab
+日志记录系统，用于管理实验运行过程中的日志输出和数据保存。主要功能包
 """
 from enum import Enum
 from contextlib import contextmanager
